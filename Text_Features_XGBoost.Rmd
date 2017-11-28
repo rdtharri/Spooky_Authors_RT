@@ -1,0 +1,302 @@
+---
+title: "Term_Features_XGBoost"
+author: "Ricky Tharrington"
+date: "November 24, 2017"
+output: html_document
+---
+
+## Initialization
+
+Load Packages
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(tidytext)
+library(widyr)
+library(Matrix)
+library(xgboost)
+library(e1071)
+library(randomForest)
+```
+
+Load Data
+
+```{r}
+train = read.csv('D:/DATA/Google Drive/Spooky_Authors/train.csv', 
+                 colClasses = c('factor','character','factor'))
+test = read.csv('D:/DATA/Google Drive/Spooky_Authors/test.csv', 
+                colClasses = c('factor','character'))
+```
+
+## Text Feature Building
+
+Creating Features from Words
+
+```{r}
+word_features = train %>%
+  unnest_tokens(word,text) %>%
+  count(word) %>%
+  filter(n > 4)  %>%
+  rename(feature = word) %>%
+  arrange(-n)
+```
+
+Creating Features from Word Pairs
+
+```{r}
+pair_features = train %>%
+  unnest_tokens(ngram, text, token = "ngrams", n = 2) %>%
+  mutate(ngramID = row_number()) %>% 
+  unnest_tokens(word, ngram) %>%
+  anti_join(stop_words, by = 'word') %>%
+  pairwise_count(word, ngramID, diag = TRUE, sort = TRUE) %>%
+  filter(item1 > item2) %>%
+  unite(pair, item1, item2) %>%
+  filter(n > 4) %>%
+  rename(feature = pair) %>%
+  arrange(-n)
+```
+
+Concatenate List of Features
+
+```{r}
+features = bind_rows(word_features,pair_features) %>%
+  arrange(-n)
+```
+
+Ideas for future features:
+  1. Limit above features by importance
+  2. Add "first word", "last word", and "punctuation" features.
+  3. Add "Special character" feature.
+
+## Training/Test Scoring
+
+Training Set Term-Document Matrix
+
+```{r}
+train_words = train %>%
+  unnest_tokens(word,text) %>%
+  group_by(id) %>%
+  count(word) %>%
+  rename(feature = word) %>%
+  arrange(id)
+  
+train_pairs = train %>%
+  unnest_tokens(ngram, text, token = "ngrams", n = 2) %>%
+  mutate(ngramID = row_number()) %>% 
+  unnest_tokens(word, ngram) %>%
+  anti_join(stop_words, by = 'word') %>%
+  group_by(id) %>%
+  pairwise_count(word, ngramID, diag = TRUE, sort = TRUE) %>%
+  filter(item1 > item2) %>%
+  unite(pair, item1, item2) %>%
+  rename(feature = pair) %>%
+  arrange(id)
+
+train_features = bind_rows(train_words,train_pairs) %>%
+  inner_join(select(features,feature), by = 'feature') %>%
+  arrange(id)
+```
+
+Testing Set Term-Document Matrix
+
+```{r}
+test_words = test %>%
+  unnest_tokens(word,text) %>%
+  group_by(id) %>%
+  count(word) %>%
+  rename(feature = word) %>%
+  arrange(id)
+  
+test_pairs = test %>%
+  unnest_tokens(ngram, text, token = "ngrams", n = 2) %>%
+  mutate(ngramID = row_number()) %>% 
+  unnest_tokens(word, ngram) %>%
+  anti_join(stop_words, by = 'word') %>%
+  group_by(id) %>%
+  pairwise_count(word, ngramID, diag = TRUE, sort = TRUE) %>%
+  filter(item1 > item2) %>%
+  unite(pair, item1, item2) %>%
+  rename(feature = pair) %>%
+  arrange(id)
+
+test_features = bind_rows(test_words,test_pairs) %>%
+  inner_join(select(features,feature), by = 'feature') %>%
+  arrange(id)
+```
+
+Sparse Matrices Creation
+
+```{r}
+train_ids = unique(as.character(train_features$id))
+test_ids = unique(as.character(test_features$id))
+full_features = bind_rows(train_features,test_features)  
+
+dtmatrix = full_features %>%
+  cast_sparse(id,feature,n)
+
+train.m = dtmatrix[1:length(train_ids),]
+test.m  = dtmatrix[(length(train_ids) + 1):(length(train_ids) + length(test_ids)),]
+
+for (miss_id in as.character(train$id)[!as.character(train$id) %in% train_ids]){
+  train.m = rbind(train.m,0)
+  rownames(train.m)[train.m@Dim[1]] = miss_id
+}
+
+for (miss_id in as.character(test$id)[!as.character(test$id) %in% test_ids]){
+  test.m = rbind(test.m,0)
+  rownames(test.m)[test.m@Dim[1]] = miss_id
+}
+
+#reset matrices to proper order
+train.m = train.m[train$id,]
+train.m_full = matrix(train.m, ncol = train.m@Dim[2])
+test.m = test.m[test$id,]
+test.m_full = matrix(test.m, ncol = test.m@Dim[2])
+target = train$author
+int_target = as.numeric(target) - 1
+```
+
+## XGBoost Training Function
+
+Function to handle validation. Trains XGBoost until validation score decreases.
+
+```{r}
+TRAIN.xgb = function(t.m,t.target,
+                     v.m,v.target,
+                     te.m,
+                     obj_function,
+                     depth,eta,child_weight){
+  
+  #special matrices for xgb.train
+  tr.m.xgb = xgb.DMatrix(data = t.m, label=t.target)
+  va.m.xgb = xgb.DMatrix(data = v.m, label=v.target)
+  
+  #list of parameters
+  params = list(booster = "gbtree"
+                     , objective = obj_function
+                     , subsample = 1
+                     , max_depth = depth
+                     , colsample_bytree = 1
+                     , eta = eta
+                     , min_child_weight = child_weight)
+  
+  #training function, where the magic happens
+  xg_model = xgb.train(params = params,
+                       data = tr.m.xgb,
+                      feval = NULL,
+                      eval_metric = 'mlogloss',
+                      nrounds = 10000,
+                      watchlist = list(train = tr.m.xgb, eval = va.m.xgb),
+                      early_stopping_rounds = 150,
+                      print_every_n = 50,
+                      maximize = F,
+                      verbose = T,
+                      num_class = 3)
+  
+  #return a slew of interesting outputs
+  #mostly predictions and scores
+  return(list(
+    p_train = predict(xg_model,t.m),
+    p_valid = predict(xg_model,v.m),
+    p_test = predict(xg_model,te.m),
+    eval_score = xg_model$best_score
+  ))
+}
+```
+## Tuning XGBoost
+
+```{r}
+depths = c(3)
+etas = seq(0.09,0.50,0.01)
+grid = expand.grid(depths = depths,etas = etas)
+cross_val = sample(1:10,replace = T,size = nrow(train.m))
+
+#build model for every eta-depth combo
+for (i in 1:nrow(grid)){
+  print(paste('Depth: ',grid[i,'depths']))
+  print(paste('Eta: ',grid[i,'etas']))
+  #build ten models, each on different folds with different validation sets
+  
+  results = TRAIN.xgb(t.m = train.m[cross_val != 1,],
+              t.target = int_target[cross_val != 1],
+              v.m = train.m[cross_val == 1,],
+              v.target = int_target[cross_val == 1],
+              te.m = test.m,
+              obj_function = "multi:softprob",
+              depth = grid[i,'depths'],
+              eta = grid[i,'etas'],
+              child_weight = 0)
+  
+  grid[i,'logloss'] = results$eval_score
+  
+}
+```
+
+## Making Predictions
+
+```{r}
+
+int_target = as.integer(target) - 1
+cross_val = sample(1:10,replace = T,size = nrow(train.m))
+test.preds = list()
+evals = list()
+
+for (i in 1:10){
+  print(paste('Building Model ',i))
+  #build ten models, each on different folds with different validation sets
+  
+  results = TRAIN.xgb(t.m = train.m[cross_val != i,],
+              t.target = int_target[cross_val != i],
+              v.m = train.m[cross_val == i,],
+              v.target = int_target[cross_val == i],
+              te.m = test.m,
+              obj_function = "multi:softprob",
+              depth = 3,
+              eta = 0.9,
+              child_weight = 0)
+  
+  test.preds[i] = list(matrix(results$p_test,byrow = T,ncol = 3))
+  
+}
+```
+
+## Creating Submission
+
+Average predicted probs.
+
+```{r}
+test_scored = Reduce("+", test.preds) / length(test.preds)
+test_scored = data.frame(test_scored)
+test_scored = cbind(test$id,test_scored)
+names(test_scored) = c('id','EAP','HPL','MWS')
+
+write.csv(test_scored, file = 'D:/DATA/Spooky_Authors/submission.csv', row.names = F)
+
+```
+
+## Folded SVM Model Ensembling
+
+```{r}
+cross_val = sample(1:10,replace = T,size = nrow(train.m))
+svm.preds = list()
+
+for (i in 1:10){
+  svm_model = svm(x = train.m_full[cross_val == i,],
+                  y = target[cross_val == i], probability = T)
+  svm.preds[i] = list(predict(svm_model, test.m_full, probability = T))
+}
+```
+
+## Test Space
+
+```{r}
+
+nb_model = naiveBayes(x = train.m_full, y = target)
+nb_predict = predict(nb_model, test.m_full)
+
+svm_model = svm(x = train.m_full[1:2000,], y = target[1:2000], probability = T)
+svm_predict = predict(svm_model, test.m_full, probability = T)
+
+```
