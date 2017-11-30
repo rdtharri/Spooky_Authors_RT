@@ -46,7 +46,7 @@ Creating Features from Word Pairs
 
 ```{r}
 pair_features = train %>%
-  unnest_tokens(ngram, text, token = "ngrams", n = 2) %>%
+  unnest_tokens(ngram, text, token = "ngrams", n = 4) %>%
   mutate(ngramID = row_number()) %>% 
   unnest_tokens(word, ngram) %>%
   anti_join(stop_words, by = 'word') %>%
@@ -151,9 +151,9 @@ for (miss_id in as.character(test$id)[!as.character(test$id) %in% test_ids]){
 
 #reset matrices to proper order
 train.m = train.m[train$id,]
-train.m_full = matrix(train.m, ncol = train.m@Dim[2])
+train.m_full = matrix(train.m,ncol = train.m@Dim[2])
 test.m = test.m[test$id,]
-test.m_full = matrix(test.m, ncol = test.m@Dim[2])
+test.m_full = matrix(test.m,ncol = train.m@Dim[2])
 target = train$author
 int_target = as.numeric(target) - 1
 ```
@@ -174,7 +174,7 @@ TRAIN.xgb = function(t.m,t.target,
   va.m.xgb = xgb.DMatrix(data = v.m, label=v.target)
   
   #list of parameters
-  params = list(booster = "gbtree"
+  params = list(booster = 'gbtree'
                      , objective = obj_function
                      , subsample = 1
                      , max_depth = depth
@@ -276,27 +276,175 @@ write.csv(test_scored, file = 'D:/DATA/Spooky_Authors/submission.csv', row.names
 
 ```
 
-## Folded SVM Model Ensembling
+## Linear XGBoost
 
 ```{r}
-cross_val = sample(1:10,replace = T,size = nrow(train.m))
-svm.preds = list()
 
-for (i in 1:10){
-  svm_model = svm(x = train.m_full[cross_val == i,],
-                  y = target[cross_val == i], probability = T)
-  svm.preds[i] = list(predict(svm_model, test.m_full, probability = T))
+TRAIN.xgb.linear = function(t.m,t.target,
+                     v.m,v.target,
+                     te.m,
+                     obj_function,
+                     lambda,lambda_bias,alpha){
+  
+  #special matrices for xgb.train
+  tr.m.xgb = xgb.DMatrix(data = t.m, label=t.target)
+  va.m.xgb = xgb.DMatrix(data = v.m, label=v.target)
+  
+  #list of parameters
+  params = list(booster = 'gblinear'
+                     , objective = obj_function
+                     , lambda = lambda
+                     , lambda_bias = lambda_bias
+                     , alpha = alpha)
+  
+  #training function, where the magic happens
+  xg_model = xgb.train(params = params,
+                       data = tr.m.xgb,
+                      feval = NULL,
+                      eval_metric = 'mlogloss',
+                      nrounds = 10000,
+                      watchlist = list(train = tr.m.xgb, eval = va.m.xgb),
+                      early_stopping_rounds = 50,
+                      print_every_n = 10,
+                      maximize = F,
+                      verbose = T,
+                      num_class = 3)
+  
+  
+  xg_model$best_ntreelimit <- NULL
+  #return a slew of interesting outputs
+  #mostly predictions and scores
+  return(list(
+    p_train = predict(xg_model,t.m),
+    p_valid = predict(xg_model,v.m),
+    p_test = predict(xg_model,te.m),
+    eval_score = xg_model$best_score
+  ))
 }
 ```
 
-## Test Space
+## Tuning Linear XGBoost
+
+```{r}
+lambdas = 10**seq(-10,0,1)
+bias_lambdas = 10**seq(-10,0,1)
+alphas = 10**seq(-10,0,1)
+grid = expand.grid(lambdas = lambdas, bias_lambdas = bias_lambdas, alphas = alphas)
+cross_val = sample(1:10,replace = T,size = nrow(train.m))
+
+#build model for every eta-depth combo
+for (i in 1:nrow(grid)){
+  print(paste('Lambda: ',grid[i,'lambdas']))
+  print(paste('Alpha: ',grid[i,'alphas']))
+  #build ten models, each on different folds with different validation sets
+  
+  results = TRAIN.xgb.linear(t.m = train.m[cross_val != 1,],
+              t.target = int_target[cross_val != 1],
+              v.m = train.m[cross_val == 1,],
+              v.target = int_target[cross_val == 1],
+              te.m = test.m,
+              obj_function = "multi:softprob",
+              lambda = grid[i,'lambdas'],
+              lambda_bias = grid[i,'bias_lambdas'],
+              alpha = grid[i,'alphas'])
+  
+  grid[i,'logloss'] = results$eval_score
+  
+}
+grid = arrange(grid,logloss)
+```
+
+## Making Predictions
 
 ```{r}
 
-nb_model = naiveBayes(x = train.m_full, y = target)
-nb_predict = predict(nb_model, test.m_full)
+int_target = as.integer(target) - 1
+test.preds = list()
+evals = list()
 
-svm_model = svm(x = train.m_full[1:2000,], y = target[1:2000], probability = T)
-svm_predict = predict(svm_model, test.m_full, probability = T)
+for (i in 1:100){
+  print(paste('Building Model ',i))
+  #build ten models, each on different folds with different validation sets
+  cross_val = sample(1:nrow(train.m),replace = T,size = nrow(train.m))
+  
+  results = TRAIN.xgb.linear(t.m = train.m[cross_val,],
+              t.target = int_target[cross_val],
+              v.m = train.m[-cross_val,],
+              v.target = int_target[-cross_val],
+              te.m = test.m,
+              obj_function = "multi:softprob",
+              lambda = 1,
+              lambda_bias = 1e-06,
+              alpha = 1e-07)
+  
+  test.preds[i] = list(matrix(results$p_test,byrow = T,ncol = 3))
+  
+}
+```
+
+## Creating Submission
+
+Average predicted probs.
+
+```{r}
+test_scored = Reduce("+", test.preds) / length(test.preds)
+test_scored = data.frame(test_scored)
+test_scored = cbind(test$id,test_scored)
+names(test_scored) = c('id','EAP','HPL','MWS')
+
+write.csv(test_scored, file = 'D:/DATA/Spooky_Authors/linear_submission.csv', row.names = F)
+```
+
+## Folded SVM Model Ensembling
+
+```{r}
+int_target = as.integer(target) - 1
+svm.preds = list()
+svm.train = list()
+evals = list()
+
+for (i in 1:20){
+  print(paste('Building Model ',i))
+  #build ten models, each on different folds with different validation sets
+  cross_val = sample(1:nrow(train.m),replace = T,size = 2000)
+  svm_model = svm(x = train.m_full[cross_val,], 
+                y = target[cross_val], 
+                probability = T)
+  svm.preds[i] = list(predict(svm_model, test.m_full, probability = T))
+  svm.train[i] = list(predict(svm_model, train.m_full, probability = T))
+}
+
+```
+
+```{r}
+svm.trainz = matrix(unlist(svm.train),ncol = length(svm.train))
+EAP.train = rep(0,length(svm.train))
+HPL.train = rep(0,length(svm.train))
+MWS.train = rep(0,length(svm.train))
+for (i in 1:nrow(svm.trainz)){
+  EAP.train[i] = mean(as.integer(svm.trainz[i,1:length(svm.train)] == 'EAP'))
+  HPL.train[i] = mean(as.integer(svm.trainz[i,1:length(svm.train)] == 'HPL'))
+  MWS.train[i] = mean(as.integer(svm.trainz[i,1:length(svm.train)] == 'MWS'))
+}
+svm.train =  data.frame(id = train$id,
+                     EAP = EAP.train,
+                     HPL = HPL.train,
+                     MWS = MWS.train)
+
+svm.test = matrix(unlist(svm.preds),ncol = length(svm.preds))
+EAP.test = rep(0,length(svm.preds))
+HPL.test = rep(0,length(svm.preds))
+MWS.test = rep(0,length(svm.preds))
+for (i in 1:nrow(svm.test)){
+  EAP.test[i] = mean(as.integer(svm.test[i,1:length(svm.preds)] == 'EAP'))
+  HPL.test[i] = mean(as.integer(svm.test[i,1:length(svm.preds)] == 'HPL'))
+  MWS.test[i] = mean(as.integer(svm.test[i,1:length(svm.preds)] == 'MWS'))
+}
+svm.test = data.frame(id = test$id,
+                     EAP = EAP.test,
+                     HPL = HPL.test,
+                     MWS = MWS.test)
+
+write.csv(svm.test, file = 'D:/DATA/Spooky_Authors/svm_submission.csv', row.names = F)
 
 ```
