@@ -1,0 +1,475 @@
+---
+title: "Text_Features_Kernel"
+author: "Ricky Tharrington"
+date: "December 1, 2017"
+output: html_document
+---
+
+## Load Packages
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(tidytext)
+library(widyr)
+library(Matrix)
+library(xgboost)
+library(stringr)
+library(e1071)
+```
+
+## Load Data
+
+```{r}
+train = read.csv('D:/DATA/Google Drive/Spooky_Authors/train.csv', 
+                 colClasses = c('factor','character','factor'))
+test = read.csv('D:/DATA/Google Drive/Spooky_Authors/test.csv', 
+                colClasses = c('factor','character'))
+```
+
+## Features From Words and Word-Pairs
+
+```{r}
+word_features = train %>%
+  unnest_tokens(word,text) %>%
+  count(word) %>%
+  filter(n > 4)  %>%
+  rename(feature = word) %>%
+  arrange(-n)
+```
+
+Creating Features from Word Pairs
+
+```{r}
+pair_features = train %>%
+  unnest_tokens(word, text) %>%
+  anti_join(stop_words, by = 'word') %>%
+  pairwise_count(word, id, diag = TRUE, sort = TRUE) %>%
+  filter(item1 > item2) %>%
+  unite(pair, item1, item2) %>%
+  filter(n > 4) %>%
+  rename(feature = pair) %>%
+  arrange(-n)
+```
+
+Concatenate List of Features
+
+```{r}
+features = bind_rows(word_features,pair_features) %>%
+  arrange(-n)
+```
+
+## Training/Test Scoring
+
+Training Set Term-Document Matrix
+
+```{r}
+train_words = train %>%
+  unnest_tokens(word,text) %>%
+  group_by(id) %>%
+  count(word) %>%
+  rename(feature = word) %>%
+  arrange(id)
+  
+train_pairs = train %>%
+  mutate(temp_id = row_number()) %>%
+  unnest_tokens(word, text) %>%
+  anti_join(stop_words, by = 'word') %>%
+  group_by(id) %>%
+  pairwise_count(word, temp_id, diag = TRUE) %>%
+  filter(item1 > item2) %>%
+  unite(feature, item1, item2) %>%
+  arrange(id)
+
+train_features = bind_rows(train_words,train_pairs) %>%
+  inner_join(select(features,feature), by = 'feature') %>%
+  arrange(id)
+```
+
+Testing Set Term-Document Matrix
+
+```{r}
+test_words = test %>%
+  unnest_tokens(word,text) %>%
+  group_by(id) %>%
+  count(word) %>%
+  rename(feature = word) %>%
+  arrange(id)
+  
+test_pairs = test %>%
+  mutate(temp_id = row_number()) %>%
+  unnest_tokens(word, text) %>%
+  anti_join(stop_words, by = 'word') %>%
+  group_by(id) %>%
+  pairwise_count(word, temp_id, diag = TRUE, sort = TRUE) %>%
+  filter(item1 > item2) %>%
+  unite(pair, item1, item2) %>%
+  rename(feature = pair) %>%
+  arrange(id)
+
+test_features = bind_rows(test_words,test_pairs) %>%
+  inner_join(select(features,feature), by = 'feature') %>%
+  arrange(id)
+```
+
+## Sparse Matrices Creation
+
+```{r}
+train_ids = unique(as.character(train_features$id))
+test_ids = unique(as.character(test_features$id))
+full_features = bind_rows(train_features,test_features)  
+
+dtmatrix = full_features %>%
+  cast_sparse(id,feature,n)
+
+train.m = dtmatrix[1:length(train_ids),]
+test.m  = dtmatrix[(length(train_ids) + 1):(length(train_ids) + length(test_ids)),]
+
+for (miss_id in as.character(train$id)[!as.character(train$id) %in% train_ids]){
+  train.m = rbind(train.m,0)
+  rownames(train.m)[train.m@Dim[1]] = miss_id
+}
+
+for (miss_id in as.character(test$id)[!as.character(test$id) %in% test_ids]){
+  test.m = rbind(test.m,0)
+  rownames(test.m)[test.m@Dim[1]] = miss_id
+}
+
+#reset matrices to proper order
+train.m = train.m[train$id,]
+test.m = test.m[test$id,]
+target = train$author
+int_target = as.numeric(target) - 1
+
+rm(test_words, test_pairs, test_features,
+   train_words, train_pairs, train_features,
+   dtmatrix)
+gc()
+```
+
+## Extra Meta-Features
+
+Count Stop Words
+
+```{r}
+stop_words_count = train %>%
+  unnest_tokens(word,text) %>%
+  inner_join(stop_words, by='word') %>%
+  count(id,word) %>%
+  ungroup() %>%
+  group_by(id) %>%
+  summarise(stop_count = sum(n))
+
+stop_words_count = stop_words_count %>%
+  full_join(select(train,id), by = 'id') %>%
+  mutate(stop_count = if_else(is.na(stop_count),0,as.double(stop_count)))
+
+stop_words_count_test = test %>%
+  unnest_tokens(word,text) %>%
+  inner_join(stop_words, by='word') %>%
+  count(id,word) %>%
+  ungroup() %>%
+  group_by(id) %>%
+  summarise(stop_count = sum(n))
+
+stop_words_count_test = stop_words_count_test %>%
+  full_join(select(test,id), by = 'id') %>%
+  mutate(stop_count = if_else(is.na(stop_count),0,as.double(stop_count)))
+```
+
+Count words that aren't stop words but also aren't features.
+
+```{r}
+non_stop_non_feature = train %>%
+  unnest_tokens(word,text) %>%
+  anti_join(stop_words, by='word') %>%
+  anti_join(word_features, by =c('word'='feature')) %>%
+  count(id,word) %>%
+  ungroup() %>%
+  group_by(id) %>%
+  summarise(non_count = sum(n))
+
+non_stop_non_feature = non_stop_non_feature %>%
+  full_join(select(train,id), by = 'id') %>%
+  mutate(non_count = if_else(is.na(non_count),0,as.double(non_count)))
+
+non_stop_non_feature_test = test %>%
+  unnest_tokens(word,text) %>%
+  anti_join(stop_words, by='word') %>%
+  anti_join(word_features, by =c('word'='feature')) %>%
+  count(id,word) %>%
+  ungroup() %>%
+  group_by(id) %>%
+  summarise(non_count = sum(n))
+
+non_stop_non_feature_test = non_stop_non_feature_test %>%
+  full_join(select(test,id), by = 'id') %>%
+  mutate(non_count = if_else(is.na(non_count),0,as.double(non_count)))
+```
+
+Punctuation
+
+```{r}
+commas_train = train %>%
+  mutate(comma_count=str_count(text,',')) %>%
+  select(1,4)
+
+colons_train = train %>%
+  mutate(colon_count=str_count(text,':')) %>%
+  select(1,4)
+
+semi_train = train %>%
+  mutate(semi_count=str_count(text,';')) %>%
+  select(1,4)
+
+period_train = train %>%
+  mutate(period_count=str_count(text,'\\.')) %>%
+  select(1,4)
+
+questions_train = train %>%
+  mutate(question_count=str_count(text,"\\?")) %>%
+  select(1,4)
+
+punct_train = data.frame(id = commas_train$id,
+                         commas = commas_train$comma_count,
+                         colons = colons_train$colon_count,
+                         semis = semi_train$semi_count,
+                         periods = period_train$period_count,
+                         questions = questions_train$question_count)
+
+commas_test = test %>%
+  mutate(comma_count=str_count(text,',')) %>%
+  select(1,3)
+
+colons_test = test %>%
+  mutate(colon_count=str_count(text,':')) %>%
+  select(1,3)
+
+semi_test = test %>%
+  mutate(semi_count=str_count(text,';')) %>%
+  select(1,3)
+
+period_test = test %>%
+  mutate(period_count=str_count(text,'\\.')) %>%
+  select(1,3)
+
+questions_test = test %>%
+  mutate(question_count=str_count(text,"\\?")) %>%
+  select(1,3)
+
+punct_test = data.frame(id = commas_test$id,
+                         commas = commas_test$comma_count,
+                         colons = colons_test$colon_count,
+                         semis = semi_test$semi_count,
+                         periods = period_test$period_count,
+                         questions = questions_test$question_count)
+```
+
+First word
+
+```{r}
+first_train = train %>%
+  unnest_tokens(word,text)
+first_id = rep(0,length(first_train$id))
+for(i in 1:length(first_train$id)){
+if(as.numeric(rownames(first_train)[[i]])%%1==0){
+  first_id[[i]] = 1
+}
+  else{}
+}
+
+first_train = as.data.frame(cbind(first_train,first_id))
+first_train = first_train %>%
+  filter(first_id==1) %>%
+  select(1,3)
+
+first_test = test %>%
+  unnest_tokens(word,text)
+first_id = rep(0,length(first_test$id))
+for(i in 1:length(first_test$id)){
+if(as.numeric(rownames(first_test)[[i]])%%1==0){
+  first_id[[i]] = 1
+}
+  else{}
+}
+
+first_test = as.data.frame(cbind(first_test,first_id))
+first_test = first_test %>%
+  filter(first_id==1) %>%
+  select(1,2)
+```
+
+Adding META Features to Matrix
+
+```{r}
+train_meta = punct_train %>%
+  inner_join(stop_words_count,by = 'id') %>%
+  inner_join(non_stop_non_feature, by = 'id')
+
+train_meta.m = as.matrix(select(train_meta,-id))
+
+test_meta = punct_test %>%
+  inner_join(stop_words_count_test,by = 'id') %>%
+  inner_join(non_stop_non_feature_test, by = 'id')
+
+test_meta.m = as.matrix(select(test_meta,-id))
+```
+
+```{r}
+train.m.full = cbind(train.m,train_meta.m)
+test.m.full = cbind(test.m,test_meta.m)
+
+train.m.full.ns = as.matrix(train.m.full)
+test.m.full.ns = as.matrix(test.m.full)
+
+rm(colons_train, colons_test,
+   commas_train, commas_test,
+   features, full_features,
+   non_stop_non_feature, non_stop_non_feature_test,
+   pair_features, word_features,
+   period_test, period_train,
+   punct_test, punct_train,
+   questions_test, questions_train,
+   semi_test,semi_train,
+   stop_words_count, stop_words_count_test,
+   test_meta, train_meta, test_meta.m, train_meta.m)
+
+gc()
+```
+
+Naive Bayes Features
+
+```{r}
+nb_model = naiveBayes(x = train.m.full.ns, y = target, laplace = 100)
+nb_train = predict(nb_model, train.m.full.ns, type = 'raw', laplace = 100)
+nb_test = predict(nb_model, test.m.full.ns, type = 'raw', laplace = 100)
+save(list = c('nb_train','nb_test'), file = 'D:/DATA/Google Drive/Spooky_Authors/NBResults.Rdata')
+```
+
+Add Bayes Results to full matrices
+
+```{r}
+train.m.full = cbind(train.m.full,nb_train)
+test.m.full = cbind(test.m.full,nb_test)
+```
+
+## XGBoost Training Function
+
+Function to handle validation. Trains XGBoost until validation score decreases.
+
+```{r}
+TRAIN.xgb = function(t.m,t.target,
+                     v.m,v.target,
+                     te.m,
+                     obj_function,
+                     depth,eta,child_weight){
+  
+  #special matrices for xgb.train
+  tr.m.xgb = xgb.DMatrix(data = t.m, label=t.target)
+  va.m.xgb = xgb.DMatrix(data = v.m, label=v.target)
+  
+  #list of parameters
+  params = list(booster = 'gbtree'
+                     , objective = obj_function
+                     , subsample = 1
+                     , max_depth = depth
+                     , colsample_bytree = 1
+                     , eta = eta
+                     , min_child_weight = child_weight)
+  
+  #training function, where the magic happens
+  xg_model = xgb.train(params = params,
+                       data = tr.m.xgb,
+                      feval = NULL,
+                      eval_metric = 'mlogloss',
+                      nrounds = 10000,
+                      watchlist = list(train = tr.m.xgb, eval = va.m.xgb),
+                      early_stopping_rounds = 150,
+                      print_every_n = 50,
+                      maximize = F,
+                      verbose = T,
+                      num_class = 3)
+  
+  #return a slew of interesting outputs
+  #mostly predictions and scores
+  return(list(
+    p_train = predict(xg_model,t.m),
+    p_valid = predict(xg_model,v.m),
+    p_test = predict(xg_model,te.m),
+    eval_score = xg_model$best_score
+  ))
+}
+```
+
+## Tuning XGBoost
+
+```{r}
+depths = seq(1,9,1)
+etas = seq(0.1,0.9,0.1)
+childs = seq(0.1,2,0.1)
+grid = expand.grid(depths = depths,etas = etas,childs = childs)
+cross_val = sample(1:10,replace = T,size = nrow(train.m.full))
+
+#build model for every eta-depth combo
+for (i in 1:nrow(grid)){
+  print(paste('Depth: ',grid[i,'depths']))
+  print(paste('Eta: ',grid[i,'etas']))
+  #build ten models, each on different folds with different validation sets
+  
+  results = TRAIN.xgb(t.m = train.m.full[cross_val != 1,],
+              t.target = int_target[cross_val != 1],
+              v.m = train.m.full[cross_val == 1,],
+              v.target = int_target[cross_val == 1],
+              te.m = test.m.full,
+              obj_function = "multi:softprob",
+              depth = grid[i,'depths'],
+              eta = grid[i,'etas'],
+              child_weight = grid[i,'childs'])
+  
+  grid[i,'logloss'] = results$eval_score
+  
+}
+grid = arrange(grid,logloss)
+```
+
+## Making Predictions
+
+```{r}
+
+int_target = as.integer(target) - 1
+cross_val = sample(1:10,replace = T,size = nrow(train.m.full))
+test.preds = list()
+evals = list()
+
+for (i in 1:10){
+  print(paste('Building Model ',i))
+  #build ten models, each on different folds with different validation sets
+  
+  results = TRAIN.xgb(t.m = train.m.full[cross_val != i,],
+              t.target = int_target[cross_val != i],
+              v.m = train.m.full[cross_val == i,],
+              v.target = int_target[cross_val == i],
+              te.m = test.m.full,
+              obj_function = "multi:softprob",
+              depth = 1,
+              eta = 0.5,
+              child_weight = 0.2)
+  
+  test.preds[i] = list(matrix(results$p_test,byrow = T,ncol = 3))
+  
+}
+```
+
+## Creating Submission
+
+Average predicted probs.
+
+```{r}
+test_scored = Reduce("+", test.preds) / length(test.preds)
+test_scored = data.frame(test_scored)
+test_scored = cbind(test$id,test_scored)
+names(test_scored) = c('id','EAP','HPL','MWS')
+
+write.csv(test_scored, file = 'D:/DATA/Spooky_Authors/submission.csv', row.names = F)
+
+```
