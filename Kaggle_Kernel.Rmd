@@ -33,7 +33,7 @@ test = read.csv('D:/DATA/Google Drive/Spooky_Authors/test.csv',
 word_features = train %>%
   unnest_tokens(word,text) %>%
   count(word) %>%
-  filter(n > 4)  %>%
+  #filter(n > 4)  %>%
   rename(feature = word) %>%
   arrange(-n)
 ```
@@ -451,8 +451,8 @@ for (i in 1:10){
               v.target = int_target[cross_val == i],
               te.m = test.m.full,
               obj_function = "multi:softprob",
-              depth = 1,
-              eta = 0.5,
+              depth = 3,
+              eta = 0.9,
               child_weight = 0.2)
   
   test.preds[i] = list(matrix(results$p_test,byrow = T,ncol = 3))

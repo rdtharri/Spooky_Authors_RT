@@ -1,0 +1,202 @@
+---
+title: "Spooky_LDA"
+author: "Ricky Tharrington"
+date: "December 2, 2017"
+output: html_document
+---
+
+## Load Packages
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(tidytext)
+library(widyr)
+library(Matrix)
+library(xgboost)
+library(stringr)
+library(e1071)
+library(topicmodels)
+
+TOPICS = 100
+```
+
+## Load Data
+
+```{r}
+train = read.csv('D:/DATA/Google Drive/Spooky_Authors/train.csv', 
+                 colClasses = c('factor','character','factor'))
+test = read.csv('D:/DATA/Google Drive/Spooky_Authors/test.csv', 
+                colClasses = c('factor','character'))
+```
+
+## Features From Words and Word-Pairs
+
+Training Words LDA
+
+```{r}
+train_words = train %>%
+  unnest_tokens(word,text) %>%
+  group_by(id) %>%
+  count(word)
+
+train.dtm = train_words %>%
+  cast_dtm(id, word, n)
+
+train.lda = LDA(train.dtm, k=TOPICS, control=list(seed=2017))
+
+train.topics = tidy(train.lda, matrix = "gamma") %>%
+  spread(topic,gamma)
+```
+
+Testing Set Term-Document Matrix
+
+```{r}
+test_words = test %>%
+  unnest_tokens(word,text) %>%
+  group_by(id) %>%
+  count(word)
+
+test.dtm = test_words %>%
+  cast_dtm(id, word, n)
+  
+test.lda = LDA(test.dtm, model=train.lda, control=list(seed=2017))
+
+test.topics = tidy(test.lda, matrix = "gamma") %>%
+  spread(topic,gamma)
+
+```
+
+Targets and Matrices
+
+```{r}
+target = arrange(train,id)$author
+int_target = as.integer(target) - 1
+
+train_id = arrange(train,id)$id
+test_id = arrange(test,id)$id
+
+train.m = matrix(unlist(train.topics[,2:(TOPICS + 1)]), ncol = TOPICS)
+test.m = matrix(unlist(test.topics[,2:(TOPICS + 1)]), ncol = TOPICS)
+```
+
+## XGBoost Training Function
+
+Function to handle validation. Trains XGBoost until validation score decreases.
+
+```{r}
+TRAIN.xgb = function(t.m,t.target,
+                     v.m,v.target,
+                     te.m,
+                     obj_function,
+                     depth,eta,child_weight){
+  
+  #special matrices for xgb.train
+  tr.m.xgb = xgb.DMatrix(data = t.m, label=t.target)
+  va.m.xgb = xgb.DMatrix(data = v.m, label=v.target)
+  
+  #list of parameters
+  params = list(booster = 'gbtree'
+                     , objective = obj_function
+                     , subsample = 1
+                     , max_depth = depth
+                     , colsample_bytree = 1
+                     , eta = eta
+                     , min_child_weight = child_weight)
+  
+  #training function, where the magic happens
+  xg_model = xgb.train(params = params,
+                       data = tr.m.xgb,
+                      feval = NULL,
+                      eval_metric = 'mlogloss',
+                      nrounds = 10000,
+                      watchlist = list(train = tr.m.xgb, eval = va.m.xgb),
+                      early_stopping_rounds = 150,
+                      print_every_n = 50,
+                      maximize = F,
+                      verbose = T,
+                      num_class = 3)
+  
+  #return a slew of interesting outputs
+  #mostly predictions and scores
+  return(list(
+    p_train = predict(xg_model,t.m),
+    p_valid = predict(xg_model,v.m),
+    p_test = predict(xg_model,te.m),
+    eval_score = xg_model$best_score
+  ))
+}
+```
+
+## Tuning XGBoost
+
+```{r}
+depths = c(3)
+etas = c(0.3)
+childs = c(0)
+grid = expand.grid(depths = depths,etas = etas,childs = childs)
+cross_val = sample(1:10,replace = T,size = nrow(train.m))
+
+#build model for every eta-depth combo
+for (i in 1:nrow(grid)){
+  print(paste('Depth: ',grid[i,'depths']))
+  print(paste('Eta: ',grid[i,'etas']))
+  #build ten models, each on different folds with different validation sets
+  
+  results = TRAIN.xgb(t.m = train.m[cross_val != 1,],
+              t.target = int_target[cross_val != 1],
+              v.m = train.m[cross_val == 1,],
+              v.target = int_target[cross_val == 1],
+              te.m = test.m,
+              obj_function = "multi:softprob",
+              depth = grid[i,'depths'],
+              eta = grid[i,'etas'],
+              child_weight = grid[i,'childs'])
+  
+  grid[i,'logloss'] = results$eval_score
+  
+}
+grid = arrange(grid,logloss)
+```
+
+## Making Predictions
+
+```{r}
+
+int_target = as.integer(target) - 1
+cross_val = sample(1:10,replace = T,size = nrow(train.m.full))
+test.preds = list()
+evals = list()
+
+for (i in 1:10){
+  print(paste('Building Model ',i))
+  #build ten models, each on different folds with different validation sets
+  
+  results = TRAIN.xgb(t.m = train.m.full[cross_val != i,],
+              t.target = int_target[cross_val != i],
+              v.m = train.m.full[cross_val == i,],
+              v.target = int_target[cross_val == i],
+              te.m = test.m.full,
+              obj_function = "multi:softprob",
+              depth = 3,
+              eta = 0.9,
+              child_weight = 0.2)
+  
+  test.preds[i] = list(matrix(results$p_test,byrow = T,ncol = 3))
+  
+}
+```
+
+## Creating Submission
+
+Average predicted probs.
+
+```{r}
+test_scored = Reduce("+", test.preds) / length(test.preds)
+test_scored = data.frame(test_scored)
+test_scored = cbind(test$id,test_scored)
+names(test_scored) = c('id','EAP','HPL','MWS')
+
+write.csv(test_scored, file = 'D:/DATA/Spooky_Authors/submission.csv', row.names = F)
+
+```
